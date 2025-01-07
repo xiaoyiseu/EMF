@@ -46,7 +46,7 @@ class FeedForwardNetwork(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x):# 前馈网络层
+    def forward(self, x):
         residual = x
         x = F.relu(self.fc1(x))
         x = self.dropout(self.fc2(x))
@@ -127,7 +127,7 @@ class Transformer(nn.Module):
         embed_dim1 = 128
         embed_dim2 = 128*2 if self.args.CMF else 128       
         self.RNN   = nn.LSTM(input_size=in_dim, hidden_size=embed_dim1, batch_first=True)
-        self.fc_severity   = nn.Linear(embed_dim2, output_dim_s)
+        self.fc_severity   = nn.Linear(embed_dim1, output_dim_s)
         self.fc_department = nn.Linear(embed_dim2, output_dim_d)
         self.resnet = ResNet(input_dim=in_dim, output_dim=128)
         self.textcnn = TextCNN(input_dim=in_dim, output_dim=128)
@@ -143,56 +143,16 @@ class Transformer(nn.Module):
     def forward(self, vs_feat, batch):
         ret = dict()
         label1, label2 = batch['Level'],  batch['Dept_digit']
-        # ChiefComplaint: [CLS]+tokens
         cc_cls = batch['CC_tokens'][:, 0, :].squeeze()  
-        cc_tokens = batch['CC_tokens'][:, 1:-1, :].squeeze()  
         cc_cls0 = self.linear_layer(cc_cls)
 
-        
         enc_cc_cls = self.encoder(cc_cls0) if self.args.SA else cc_cls0
-        # enc_cc_cls = self.decoder(cc_cls0, enc_cc_cls0)
         encoder_vs = self.encoder(vs_feat) if self.args.SA else vs_feat
         # ************************************************************************************
         #                            backbone  
         # ************************************************************************************
-        if self.args.backbone == 'NoLocalCC': 
-            # fusion1_cc =self.cross_att(enc_cc_cls, encoder_vs)
-            # fusion2_vs =self.cross_att(encoder_vs, enc_cc_cls)
+        if self.args.backbone == 'NomSEN': 
             logit_cc, logit_vs = enc_cc_cls, encoder_vs
-
-        if self.args.backbone == 'Concat':  
-            _, (h_n_rst, _) = self.RNN(cc_tokens)
-            stats = statistics(h_n_rst[-1]) 
-            cc_tks_stats = stats.view(stats.size(0), -1) 
-            linear_layer = nn.Linear(cc_tks_stats.size(-1), 128).to(cc_tokens.device) 
-            cc_tks_stats = linear_layer(cc_tks_stats) 
-
-            # cc_tks = self.encoder(cc_tks_stats)
-            LSTM   = FeatureExtractor(input_dim=cc_tks_stats.size(-1), hidden_dim=64, output_dim=128).to(cc_tks_stats.device)     
-            cc_tks = LSTM(cc_tks_stats)
-
-            # fusion1_cc = torch.cat((cc_tks, enc_cc_cls), dim = -1)  
-            logit_cc = self.cross_att(enc_cc_cls, cc_tks)  
-            logit_vs = self.cross_att(encoder_vs, enc_cc_cls)  
-
-        if self.args.backbone == 'CrossAtt':
-            cc_tokens0 = self.linear_layer(cc_tokens) 
-            if self.args.filt:
-                padding_mask = (cc_tokens.abs().sum(dim=-1) > 0).float()
-                final_mask_cc = filter_tokens(cc_cls0.unsqueeze(1), cc_tokens0, 
-                                              padding_mask=padding_mask, 
-                                              threshold=self.args.threshold)            
-                expanded_mask = final_mask_cc.unsqueeze(-1)
-                tokens = cc_tokens * expanded_mask.float() #[B, N, 786]
-            else :
-                tokens = cc_tokens
-            cc_toks = self.textcnn(tokens)            
-            logit_cc = enc_cc_cls
-            logit_vs = encoder_vs
-
-        if self.args.backbone == 'NoCrossAtt':
-            logit_cc = enc_cc_cls
-            logit_vs = encoder_vs
         
         if self.args.backbone == 'Transformer':
             logit_cc = self.decoder(cc_cls0, enc_cc_cls)
@@ -215,21 +175,21 @@ class Transformer(nn.Module):
 
         if self.args.CA:
             fusion1_cc = self.cross_att(logit_cc, logit_vs)   
-            fusion2_vs =  logit_vs#self.cross_att(logit_vs, logit_cc)
+            fusion2_vs =  self.cross_att(logit_vs, logit_cc)
         else:
             fusion1_cc = logit_cc
             fusion2_vs = logit_vs
         
         if self.args.CMF:
-            if self.args.backbone == 'CrossAtt':
-                fusion_data = torch.cat((fusion1_cc, cc_toks), dim=-1) 
-            else:
-                fusion_data = torch.cat((fusion1_cc, fusion2_vs), dim=-1)
+            fusion_data = torch.cat((fusion1_cc, fusion2_vs), dim=-1)
         else:
             fusion_data = fusion1_cc
             
-        severity_out = self.fc_severity(fusion_data) # or fusion_data(略有提升)
+        severity_out = self.fc_severity(fusion2_vs)
         department_out = self.fc_department(fusion_data) 
+
+
+
         # ************************************************************************************
         #                            loss  
         # ************************************************************************************
@@ -281,9 +241,9 @@ def Resample(data, labels, n_dim = 128):
     all_means = []
     all_vars = []
     for label in unique_labels:
-        category_data = data[labels == label]  # 直接获取该类别所有的样本
-        mean = category_data.mean(dim=1)  # (num_samples_in_category, n_feat1)
-        var = category_data.var(dim=1, unbiased=False)  # (num_samples_in_category, n_feat1)
+        category_data = data[labels == label] 
+        mean = category_data.mean(dim=1) 
+        var = category_data.var(dim=1, unbiased=False) 
         all_means.append(mean)
         all_vars.append(var)
     all_means = torch.cat(all_means, dim=0)  # (B, n_feat1)
@@ -312,7 +272,7 @@ def filter_tokens(cls_embeddings, token_embeddings, padding_mask=None, threshold
     similarity_mask = cosine_sim >= threshold  # [batch_size, seq_len]
     
     if padding_mask is not None:
-        final_mask = similarity_mask & padding_mask.bool()  # 考虑 padding_mask
+        final_mask = similarity_mask & padding_mask.bool()
     else:
         final_mask = similarity_mask
     return final_mask
